@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EventType {
+  TURBOPUFFER_QUERY
+  TURBOPUFFER_UPSERT
+  JINA_EMBEDDINGS
+  JINA_RERANK
+  TURBOPUFFER_NAMESPACE_QUERY
+  TURBOPUFFER_NAMESPACE_UPSERT
+  TURBOPUFFER_NAMESPACE_CLEAR
+  TURBOPUFFER_NAMESPACE_EXISTS
+  TURBOPUFFER_HYBRID
+  TURBOPUFFER_CHUNKS_IDS
+  TURBOPUFFER_CHUNKS_DELETE
+}
+
+model ApiKey {
+  id         Int           @id @default(autoincrement())
+  hash       String        @unique
+  createdAt  DateTime      @default(now())
+  namespaces Namespace[]
+  events     Event[]
+  emails     ApiKeyEmail[]
+  rateLimits RateLimit[]
+}
+
+model Namespace {
+  id       Int     @id @default(autoincrement())
+  name     String  @unique
+  rootPath String?
+  apiKey   ApiKey  @relation(fields: [apiKeyId], references: [id])
+  apiKeyId Int
+  events   Event[]
+}
+
+model Event {
+  id          Int        @id @default(autoincrement())
+  type        EventType
+  namespace   Namespace? @relation(fields: [namespaceId], references: [id])
+  namespaceId Int?
+  metadata    Json?
+  durationMs  Int?
+  statusCode  Int?
+  createdAt   DateTime   @default(now())
+  apiKey      ApiKey     @relation(fields: [apiKeyId], references: [id])
+  apiKeyId    Int
+}
+
+model ApiKeyEmail {
+  id        Int      @id @default(autoincrement())
+  email     String
+  apiKey    ApiKey   @relation(fields: [apiKeyId], references: [id])
+  apiKeyId  Int
+  createdAt DateTime @default(now())
+
+  @@unique([email, apiKeyId])
+  @@index([email])
+}
+
+model RateLimit {
+  id            Int       @id @default(autoincrement())
+  apiKey        ApiKey    @relation(fields: [apiKeyId], references: [id])
+  apiKeyId      Int
+  eventType     EventType
+  limit         Int // max allowed within the window
+  windowSeconds Int // window size in seconds
+  used          Int       @default(0) // count used in current window
+  windowResetAt DateTime // when the current window resets
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([apiKeyId, eventType])
+  @@index([apiKeyId, eventType])
+}

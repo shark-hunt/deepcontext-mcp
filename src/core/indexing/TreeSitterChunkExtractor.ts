@@ -1,0 +1,1281 @@
+/**
+ * TreeSitterChunkExtractor - AST-Based Semantic Chunking
+ * 
+ * Creates meaningful code chunks based on AST structure rather than individual symbols.
+ * Inspired by research from:
+ * - the-dream-machine/ebdde5abc0e7432d66ca16bc48c8108d
+ * - CintraAI/code-chunker 
+ * - yilinjz/astchunk
+ * 
+ * Key Principle: Extract complete semantic units (full classes, functions, interfaces)
+ * not individual symbol metadata.
+ */
+
+import { Logger } from '../../utils/Logger.js';
+import { SymbolInfo } from '../../types/core.js';
+import { ConfigurationService } from '../../services/ConfigurationService.js';
+import * as crypto from 'crypto';
+
+// Import Tree-sitter modules
+let Parser: any;
+let TypeScriptLanguage: any;
+let JavaScriptLanguage: any;
+let PythonLanguage: any;
+
+// Lazy load Tree-sitter modules
+async function loadTreeSitter() {
+    if (!Parser) {
+        Parser = (await import('tree-sitter')).default;
+        const tsModule = await import('tree-sitter-typescript');
+        const jsModule = await import('tree-sitter-javascript');
+        const pyModule = await import('tree-sitter-python');
+
+        TypeScriptLanguage = tsModule.default.typescript;
+        JavaScriptLanguage = jsModule.default;
+        PythonLanguage = pyModule.default;
+    }
+}
+
+interface TreeSitterNode {
+    type: string;
+    text: string;
+    startPosition: { row: number; column: number };
+    endPosition: { row: number; column: number };
+    children: TreeSitterNode[];
+    namedChildren: TreeSitterNode[];
+    startIndex: number;
+    endIndex: number;
+    parent?: TreeSitterNode;
+}
+
+export interface SemanticChunk {
+    id: string;
+    content: string;
+    filePath: string;
+    relativePath: string;
+    startLine: number;
+    endLine: number;
+    language: string;
+    chunkType: 'class' | 'function' | 'interface' | 'type' | 'module' | 'mixed';
+    symbols: SymbolInfo[];
+    imports: Array<{
+        module: string;
+        symbols: string[];
+        line: number;
+    }>;
+    size: number; // character count
+    complexity: 'low' | 'medium' | 'high'; // based on nested structures
+}
+
+export interface ChunkExtractionResult {
+    chunks: SemanticChunk[];
+    parseErrors: string[];
+    metadata: {
+        totalNodes: number;
+        totalChunks: number;
+        averageChunkSize: number;
+        processingTime: number;
+    };
+}
+
+export class TreeSitterChunkExtractor {
+    private parsers = new Map<string, any>();
+    private initialized = false;
+    private logger: Logger;
+    
+    // Chunking parameters (based on research)
+    private readonly MIN_CHUNK_SIZE = 30;   // capture small functions while avoiding tiny fragments
+    private readonly PREFERRED_CHUNK_SIZE = 1000; // sweet spot for search
+
+    constructor(private configurationService: ConfigurationService) {
+        this.logger = new Logger('TREESITTER-CHUNKER', 'info');
+    }
+
+    /**
+     * Generate a short, unique ID that fits within Turbopuffer's 64-byte limit
+     */
+    private generateShortId(filePath: string, suffix: string): string {
+        // Extract just the filename from the path
+        const fileName = filePath.split('/').pop() || filePath;
+        const baseName = fileName.split('.')[0]; // Remove extensions
+        
+        // Create a short hash from the full path for uniqueness
+        const pathHash = crypto.createHash('md5').update(filePath).digest('hex').substring(0, 8);
+        
+        // Combine into a short ID: basename_hash_suffix
+        const shortId = `${baseName}_${pathHash}_${suffix}`;
+        
+        // Ensure it's under 64 bytes
+        return shortId.length > 60 ? shortId.substring(0, 60) : shortId;
+    }
+
+    async initialize(): Promise<void> {
+        if (this.initialized) return;
+
+        try {
+            await loadTreeSitter();
+            
+            // Initialize parsers
+            const tsParser = new Parser();
+            tsParser.setLanguage(TypeScriptLanguage);
+            this.parsers.set('typescript', tsParser);
+
+            const jsParser = new Parser();
+            jsParser.setLanguage(JavaScriptLanguage);
+            this.parsers.set('javascript', jsParser);
+
+            const pyParser = new Parser();
+            pyParser.setLanguage(PythonLanguage);
+            this.parsers.set('python', pyParser);
+
+            this.initialized = true;
+            this.logger.info('✅ Tree-sitter chunker initialized successfully (TypeScript, JavaScript, Python)');
+            
+        } catch (error) {
+            this.logger.error(`❌ Tree-sitter chunker initialization failed: ${error}`);
+            throw error;
+        }
+    }
+
+    /**
+     * Extract semantic chunks from source code using AST structure
+     */
+    async extractSemanticChunks(
+        content: string,
+        language: string,
+        filePath: string,
+        relativePath: string = filePath
+    ): Promise<ChunkExtractionResult> {
+        const startTime = Date.now();
+        await this.initialize();
+
+        if (!this.parsers.has(language)) {
+            throw new Error(`Unsupported language: ${language}`);
+        }
+
+        const parser = this.parsers.get(language)!;
+        const chunks: SemanticChunk[] = [];
+        const parseErrors: string[] = [];
+
+        try {
+            // TreeSitter's actual limit based on testing
+            const TREESITTER_LIMIT = 32768; // 32KB - TreeSitter's proven reliable limit
+            
+            if (content.length > TREESITTER_LIMIT) {
+                this.logger.warn(`File ${filePath} (${content.length} chars) exceeds Tree-sitter limit, using smart pre-chunking`);
+                return this.handleLargeFile(content, filePath, relativePath, language, parser);
+            }
+
+            // Parse the entire file to get AST
+            const tree = parser.parse(content);
+            const rootNode = tree.rootNode;
+
+            // Find semantic units in the AST
+            const semanticUnits = this.findSemanticUnits(rootNode, content);
+            
+            // Convert semantic units to chunks (pure semantic approach - no size splitting)
+            for (const unit of semanticUnits) {
+                const chunk = await this.createChunkFromUnit(
+                    unit,
+                    content,
+                    filePath,
+                    relativePath,
+                    language
+                );
+
+                if (chunk) {
+                    chunks.push(chunk);
+                }
+            }
+
+            // If no semantic units found, create a single chunk for the entire file
+            if (chunks.length === 0 && content.trim().length > 0) {
+                const fallbackChunk = await this.createChunkFromContent(
+                    content,
+                    1,
+                    content.split('\n').length,
+                    filePath,
+                    relativePath,
+                    language,
+                    'mixed'
+                );
+                if (fallbackChunk) {
+                    chunks.push(fallbackChunk);
+                }
+            } else if (chunks.length > 0) {
+                // Check if there's remaining content after the last chunk
+                const lines = content.split('\n');
+                const lastChunk = chunks[chunks.length - 1];
+
+                if (lastChunk.endLine < lines.length) {
+                    const remainingContent = lines.slice(lastChunk.endLine).join('\n').trim();
+                    if (remainingContent.length > 20) { // Only if substantial content remains
+                        const tailChunk = await this.createChunkFromContent(
+                            remainingContent,
+                            lastChunk.endLine + 1,
+                            lines.length,
+                            filePath,
+                            relativePath,
+                            language,
+                            'mixed'
+                        );
+                        if (tailChunk) {
+                            chunks.push(tailChunk);
+                        }
+                    }
+                }
+            }
+
+            const processingTime = Date.now() - startTime;
+            const totalNodes = this.countNodes(rootNode);
+            const averageChunkSize = chunks.reduce((sum, chunk) => sum + chunk.size, 0) / chunks.length || 0;
+
+            this.logger.info(`Created ${chunks.length} semantic chunks from ${filePath}`);
+
+            return {
+                chunks,
+                parseErrors,
+                metadata: {
+                    totalNodes,
+                    totalChunks: chunks.length,
+                    averageChunkSize,
+                    processingTime
+                }
+            };
+
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.logger.error(`Chunking failed for ${filePath}: ${errorMessage}`);
+            parseErrors.push(`AST parsing failed: ${errorMessage}`);
+            
+            // Fallback to simple chunking
+            return this.fallbackToSimpleChunking(content, filePath, relativePath, language);
+        }
+    }
+
+    /**
+     * Find semantic units in the AST (complete classes, functions, interfaces, etc.)
+     */
+    private findSemanticUnits(rootNode: TreeSitterNode, sourceCode: string): SemanticUnit[] {
+        const units: SemanticUnit[] = [];
+
+        // Define what constitutes a semantic unit based on AST node types
+        const semanticNodeTypes = new Set([
+            // TypeScript/JavaScript
+            'class_declaration',
+            'interface_declaration',
+            'type_alias_declaration',
+            'function_declaration',
+            'method_definition',  // Re-added for smart class splitting
+            'namespace_declaration',
+            'enum_declaration',
+            // Python
+            'class_definition',
+            'function_definition',
+            'decorated_definition' // For @decorator functions/classes
+            // Note: Removed individual import statements to avoid tiny chunks
+            // Imports will be captured via symbol extraction instead
+        ]);
+
+        // Traverse AST to find semantic units
+        this.traverseForSemanticUnits(rootNode, units, semanticNodeTypes, sourceCode);
+
+        // Sort units by position
+        units.sort((a, b) => a.startIndex - b.startIndex);
+
+        // Merge small adjacent units and handle overlaps
+        return this.optimizeSemanticUnits(units, sourceCode);
+    }
+
+    private traverseForSemanticUnits(
+        node: TreeSitterNode,
+        units: SemanticUnit[],
+        semanticTypes: Set<string>,
+        sourceCode: string
+    ): void {
+        // Check if this node represents a semantic unit
+        if (semanticTypes.has(node.type)) {
+            const unitText = sourceCode.slice(node.startIndex, node.endIndex);
+
+            // Include all semantic units regardless of size (pure semantic approach)
+            if (unitText.length >= this.MIN_CHUNK_SIZE) {
+                units.push({
+                    type: this.mapNodeTypeToChunkType(node.type),
+                    startIndex: node.startIndex,
+                    endIndex: node.endIndex,
+                    startLine: node.startPosition.row + 1,
+                    endLine: node.endPosition.row + 1,
+                    node: node,
+                    content: unitText
+                });
+
+                // Smart hierarchical chunking: For large classes, extract both class AND methods
+                if (['class_declaration', 'class_definition'].includes(node.type)) {
+                    const classLines = node.endPosition.row - node.startPosition.row + 1;
+                    const className = this.getNodeName?.(node) || 'unknown';
+
+                    this.logger?.info(`🔍 Found class: ${className} (${classLines} lines)`);
+
+                    // If class is large (>150 lines), also extract individual methods
+                    if (classLines > 150) {
+                        this.logger?.info(`📤 Splitting large class: ${className} (${classLines} lines > 150)`);
+                        this.extractMethodsFromLargeClass(node, units, semanticTypes, sourceCode);
+                    } else {
+                        this.logger?.info(`📦 Keeping small class intact: ${className} (${classLines} lines <= 150)`);
+                    }
+                    return; // Don't traverse normally to avoid duplicates
+                }
+
+                // For namespaces, don't traverse children (complete unit)
+                if (['namespace_declaration'].includes(node.type)) {
+                    return;
+                }
+            }
+        }
+
+        // Continue traversal for child nodes
+        for (const child of node.namedChildren) {
+            this.traverseForSemanticUnits(child, units, semanticTypes, sourceCode);
+        }
+    }
+
+    /**
+     * Extract individual methods from large classes for better granularity
+     */
+    private extractMethodsFromLargeClass(
+        classNode: TreeSitterNode,
+        units: SemanticUnit[],
+        semanticTypes: Set<string>,
+        sourceCode: string
+    ): void {
+        let methodCount = 0;
+        this.logger?.info(`🔧 Extracting methods from large class with ${classNode.namedChildren.length} children`);
+
+        // Look for class_body first, then methods within it
+        const classBody = classNode.namedChildren.find(child => child.type === 'class_body');
+        const nodesToCheck = classBody ? classBody.namedChildren : classNode.namedChildren;
+
+        this.logger?.info(`🔍 Checking ${nodesToCheck.length} nodes for methods (using ${classBody ? 'class_body' : 'direct children'})`);
+
+        for (const child of nodesToCheck) {
+            this.logger?.info(`   Child type: ${child.type} at lines ${child.startPosition.row + 1}-${child.endPosition.row + 1}`);
+
+            if (child.type === 'method_definition') {
+                const methodText = sourceCode.slice(child.startIndex, child.endIndex);
+                const methodName = this.getNodeName(child) || 'unknown';
+                const methodLines = child.endPosition.row - child.startPosition.row + 1;
+
+                this.logger?.info(`   🎯 Found method: ${methodName} (${methodLines} lines, ${methodText.length} chars)`);
+
+                if (methodText.length >= this.MIN_CHUNK_SIZE) {
+                    units.push({
+                        type: 'function', // Methods are treated as functions for chunking
+                        startIndex: child.startIndex,
+                        endIndex: child.endIndex,
+                        startLine: child.startPosition.row + 1,
+                        endLine: child.endPosition.row + 1,
+                        node: child,
+                        content: methodText
+                    });
+                    methodCount++;
+                    this.logger?.info(`   ✅ Added method chunk: ${methodName}`);
+                } else {
+                    this.logger?.info(`   ❌ Method too small: ${methodName} (${methodText.length} < ${this.MIN_CHUNK_SIZE})`);
+                }
+            }
+
+            // Recursively check nested classes or other structures (but avoid infinite recursion)
+            if (child.namedChildren.length > 0 && ['class_declaration', 'class_definition'].includes(child.type)) {
+                this.extractMethodsFromLargeClass(child, units, semanticTypes, sourceCode);
+            }
+        }
+
+        this.logger?.info(`🏁 Extracted ${methodCount} methods from large class`);
+    }
+
+    private optimizeSemanticUnits(units: SemanticUnit[], sourceCode: string): SemanticUnit[] {
+        const optimized: SemanticUnit[] = [];
+        let currentUnit: SemanticUnit | null = null;
+
+        for (const unit of units) {
+            if (!currentUnit) {
+                currentUnit = unit;
+                continue;
+            }
+
+            const gap = unit.startIndex - currentUnit.endIndex;
+            const combinedSize = (unit.endIndex - currentUnit.startIndex);
+
+            // Merge if gap is small and combined size is reasonable
+            const chunkingConfig = this.configurationService.getChunkingConfig();
+            if (gap < 100 && combinedSize <= chunkingConfig.maxChunkSize) {
+                // Merge units
+                currentUnit = {
+                    type: 'mixed',
+                    startIndex: currentUnit.startIndex,
+                    endIndex: unit.endIndex,
+                    startLine: currentUnit.startLine,
+                    endLine: unit.endLine,
+                    node: currentUnit.node, // Keep first node as reference
+                    content: sourceCode.slice(currentUnit.startIndex, unit.endIndex)
+                };
+            } else {
+                // Add current unit and start new one
+                optimized.push(currentUnit);
+                currentUnit = unit;
+            }
+        }
+
+        if (currentUnit) {
+            optimized.push(currentUnit);
+        }
+
+        return optimized;
+    }
+
+    private async createChunkFromUnit(
+        unit: SemanticUnit,
+        sourceCode: string,
+        filePath: string,
+        relativePath: string,
+        language: string
+    ): Promise<SemanticChunk> {
+        // Note: Symbol extraction removed - handled by IndexingOrchestrator to avoid duplication
+
+        // Extract imports using the comprehensive import extraction
+        const imports = this.extractImportsFromContent(unit.content);
+
+        // Generate unique chunk ID (short format for Turbopuffer)
+        const chunkId = this.generateShortId(filePath, `${unit.startLine}-${unit.endLine}`);
+
+        return {
+            id: chunkId,
+            content: unit.content,
+            filePath,
+            relativePath,
+            startLine: unit.startLine,
+            endLine: unit.endLine,
+            language,
+            chunkType: unit.type,
+            symbols: [], // Will be populated by IndexingOrchestrator
+            imports,
+            size: unit.content.length,
+            complexity: this.calculateComplexity(unit.content)
+        };
+    }
+
+    // Symbol extraction removed - handled by IndexingOrchestrator to avoid duplication
+
+    // Symbol extraction removed - handled by IndexingOrchestrator to avoid duplication
+
+    // Symbol extraction removed - handled by IndexingOrchestrator to avoid duplication
+
+    /**
+     * Split large semantic units (like huge classes) into manageable chunks
+     * while preserving semantic boundaries
+     */
+    private async splitLargeSemanticUnit(
+        unit: SemanticUnit,
+        sourceCode: string,
+        filePath: string,
+        relativePath: string,
+        language: string
+    ): Promise<SemanticChunk[]> {
+        const chunkingConfig = this.configurationService.getChunkingConfig();
+        const chunks: SemanticChunk[] = [];
+
+        this.logger.info(`Splitting large ${unit.type}: ${unit.content.length} chars at ${filePath}:${unit.startLine}-${unit.endLine}`);
+
+        // For classes, try to split by methods while preserving class structure
+        if (unit.type === 'class' && unit.node) {
+            const classSplits = await this.splitClassIntoMethods(unit, sourceCode, filePath, relativePath, language);
+            if (classSplits.length > 1) {
+                return classSplits;
+            }
+        }
+
+        // Fallback: Split by line boundaries while preserving scope
+        return await this.splitByLineBoundaries(unit, sourceCode, filePath, relativePath, language);
+    }
+
+    /**
+     * Split a large class by its methods while preserving class context
+     */
+    private async splitClassIntoMethods(
+        unit: SemanticUnit,
+        sourceCode: string,
+        filePath: string,
+        relativePath: string,
+        language: string
+    ): Promise<SemanticChunk[]> {
+        const chunks: SemanticChunk[] = [];
+        const lines = unit.content.split('\n');
+        const chunkingConfig = this.configurationService.getChunkingConfig();
+
+        // Extract class header (class declaration + initial content)
+        let classHeader = '';
+        let currentMethodChunk = '';
+        let methodStartLine = unit.startLine;
+        let inMethod = false;
+        let braceDepth = 0;
+        let chunkIndex = 0;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmed = line.trim();
+
+            // Track brace depth
+            braceDepth += (line.match(/\{/g) || []).length;
+            braceDepth -= (line.match(/\}/g) || []).length;
+
+            // Detect method boundaries (simple heuristic)
+            const isMethodStart = trimmed.match(/^\s*(?:public|private|protected|async)?\s*\w+\s*\(/);
+
+            if (!inMethod && (i < 5 || !isMethodStart)) {
+                // Accumulate class header (first few lines and non-methods)
+                classHeader += (classHeader ? '\n' : '') + line;
+            } else {
+                if (!inMethod && isMethodStart) {
+                    // Starting a new method
+                    inMethod = true;
+                    methodStartLine = unit.startLine + i;
+                }
+
+                currentMethodChunk += (currentMethodChunk ? '\n' : '') + line;
+
+                // If we've accumulated enough content or reached method boundary
+                if ((currentMethodChunk.length > chunkingConfig.maxChunkSize * 0.8) ||
+                    (inMethod && braceDepth <= 1 && trimmed === '}')) {
+
+                    // Create chunk with class context
+                    const chunkContent = classHeader + '\n\n// --- Method section ---\n' + currentMethodChunk;
+
+                    chunks.push({
+                        id: this.generateShortId(filePath, `class_${chunkIndex++}`),
+                        content: chunkContent,
+                        filePath,
+                        relativePath,
+                        startLine: methodStartLine,
+                        endLine: unit.startLine + i,
+                        language,
+                        chunkType: 'class',
+                        symbols: [], // Will be populated by IndexingOrchestrator
+                        imports: this.extractImportsFromContent(chunkContent),
+                        size: chunkContent.length,
+                        complexity: this.calculateComplexity(chunkContent)
+                    });
+
+                    // Reset for next method
+                    currentMethodChunk = '';
+                    inMethod = false;
+                    methodStartLine = unit.startLine + i + 1;
+                }
+            }
+        }
+
+        // Add final chunk if there's remaining content
+        if (currentMethodChunk.trim()) {
+            const chunkContent = classHeader + '\n\n// --- Final section ---\n' + currentMethodChunk;
+            chunks.push({
+                id: this.generateShortId(filePath, `class_${chunkIndex}`),
+                content: chunkContent,
+                filePath,
+                relativePath,
+                startLine: methodStartLine,
+                endLine: unit.endLine,
+                language,
+                chunkType: 'class',
+                symbols: [], // Will be populated by IndexingOrchestrator
+                imports: this.extractImportsFromContent(chunkContent),
+                size: chunkContent.length,
+                complexity: this.calculateComplexity(chunkContent)
+            });
+        }
+
+        return chunks.length > 1 ? chunks : [];
+    }
+
+    /**
+     * Fallback: Split by line boundaries while preserving semantic structure
+     */
+    private async splitByLineBoundaries(
+        unit: SemanticUnit,
+        sourceCode: string,
+        filePath: string,
+        relativePath: string,
+        language: string
+    ): Promise<SemanticChunk[]> {
+        const chunks: SemanticChunk[] = [];
+        const lines = unit.content.split('\n');
+        const chunkingConfig = this.configurationService.getChunkingConfig();
+        const linesPerChunk = Math.ceil(chunkingConfig.maxChunkSize / 80); // Assume ~80 chars per line
+
+        for (let i = 0; i < lines.length; i += linesPerChunk) {
+            const chunkLines = lines.slice(i, Math.min(i + linesPerChunk, lines.length));
+            const chunkContent = chunkLines.join('\n');
+
+            chunks.push({
+                id: this.generateShortId(filePath, `split_${Math.floor(i / linesPerChunk)}`),
+                content: chunkContent,
+                filePath,
+                relativePath,
+                startLine: unit.startLine + i,
+                endLine: unit.startLine + i + chunkLines.length - 1,
+                language,
+                chunkType: unit.type,
+                symbols: [], // Will be populated by IndexingOrchestrator
+                imports: this.extractImportsFromContent(chunkContent),
+                size: chunkContent.length,
+                complexity: this.calculateComplexity(chunkContent)
+            });
+        }
+
+        return chunks;
+    }
+
+    private calculateComplexity(content: string): 'low' | 'medium' | 'high' {
+        const lines = content.split('\n').length;
+        const nestingLevel = (content.match(/{/g) || []).length;
+        
+        if (lines < 20 && nestingLevel < 3) return 'low';
+        if (lines < 100 && nestingLevel < 10) return 'medium';
+        return 'high';
+    }
+
+    private mapNodeTypeToChunkType(nodeType: string): SemanticChunk['chunkType'] {
+        switch (nodeType) {
+            // TypeScript/JavaScript
+            case 'class_declaration': return 'class';
+            case 'interface_declaration': return 'interface';
+            case 'type_alias_declaration': return 'type';
+            case 'function_declaration':
+            case 'method_definition':
+            case 'arrow_function': return 'function';
+            case 'namespace_declaration': return 'module';
+            // Python
+            case 'class_definition': return 'class';
+            case 'function_definition': return 'function';
+            case 'decorated_definition': return 'function'; // Treat decorated items as functions
+            case 'import_statement':
+            case 'import_from_statement': return 'module';
+            default: return 'mixed';
+        }
+    }
+
+    private mapNodeTypeToSymbolType(nodeType: string): SemanticChunk['symbols'][0]['type'] {
+        switch (nodeType) {
+            // TypeScript/JavaScript
+            case 'class_declaration': return 'class';
+            case 'interface_declaration': return 'interface';
+            case 'type_alias_declaration': return 'type';
+            case 'function_declaration': return 'function';
+            // Python
+            case 'class_definition': return 'class';
+            case 'function_definition': return 'function';
+            case 'decorated_definition': return 'function';
+            default: return 'variable';
+        }
+    }
+
+    private getNodeName(node: TreeSitterNode): string | null {
+        // Try to find identifier child node
+        for (const child of node.namedChildren) {
+            if (child.type === 'identifier') {
+                return child.text;
+            }
+        }
+        return null;
+    }
+
+    private countNodes(node: TreeSitterNode): number {
+        let count = 1;
+        for (const child of node.children) {
+            count += this.countNodes(child);
+        }
+        return count;
+    }
+
+
+    private async handleLargeFile(
+        content: string,
+        filePath: string,
+        relativePath: string,
+        language: string,
+        parser: any
+    ): Promise<ChunkExtractionResult> {
+        this.logger.info(`Using intelligent TreeSitter range-based parsing for large file: ${filePath}`);
+
+        // Use intelligent range-based TreeSitter parsing instead of crude fallback
+        return await this.intelligentRangeBasedParsing(
+            content, filePath, relativePath, language, parser
+        );
+    }
+
+    /**
+     * Intelligent Range-Based TreeSitter Parsing
+     * Splits large files into semantic ranges and parses each with TreeSitter
+     */
+    private async intelligentRangeBasedParsing(
+        content: string,
+        filePath: string,
+        relativePath: string,
+        language: string,
+        parser: any
+    ): Promise<ChunkExtractionResult> {
+        const startTime = Date.now();
+        const WINDOW_SIZE = 30000; // 30KB windows (safe under 32KB limit)
+        const OVERLAP_SIZE = 2000;  // 2KB overlap for context preservation
+
+        // Step 1: Find semantic boundaries (class/function/interface starts)
+        const semanticBoundaries = this.findSemanticBoundaries(content);
+
+        // Step 2: Create overlapping windows that respect semantic boundaries
+        const windows = this.createIntelligentWindows(
+            content, semanticBoundaries, WINDOW_SIZE, OVERLAP_SIZE
+        );
+
+        this.logger.info(`Created ${windows.length} intelligent windows for TreeSitter parsing`);
+
+        const allChunks: SemanticChunk[] = [];
+        const allErrors: string[] = [];
+        let totalNodes = 0;
+
+        // Step 3: Parse each window with TreeSitter
+        for (let i = 0; i < windows.length; i++) {
+            const window = windows[i];
+
+            try {
+                this.logger.debug(`Parsing window ${i + 1}/${windows.length} (${window.content.length} chars)`);
+
+                const tree = parser.parse(window.content);
+                const rootNode = tree.rootNode;
+
+                if (rootNode.hasError) {
+                    allErrors.push(`Window ${i} has parse errors`);
+                }
+
+                // Create comprehensive chunks from this window to ensure full content coverage
+                const windowChunks = await this.createComprehensiveWindowChunks(
+                    rootNode,
+                    window.content,
+                    filePath,
+                    relativePath,
+                    language,
+                    i
+                );
+                totalNodes += this.countNodes(rootNode);
+
+                // Adjust line numbers to file coordinates and add to collection
+                for (const chunk of windowChunks) {
+                    chunk.startLine += window.startLine;
+                    chunk.endLine += window.startLine;
+                    chunk.id = this.generateShortId(filePath, `w${i}_${chunk.startLine}-${chunk.endLine}`);
+
+                    // Adjust symbol line numbers
+                    chunk.symbols.forEach(symbol => {
+                        symbol.startLine += window.startLine;
+                        symbol.endLine += window.startLine;
+                    });
+
+                    allChunks.push(chunk);
+                }
+
+            } catch (error) {
+                this.logger.warn(`TreeSitter parsing failed for window ${i}: ${error}`);
+                allErrors.push(`Window ${i}: ${error}`);
+
+                // Even if TreeSitter fails, create a semantic chunk for this window
+                const fallbackChunk = this.createSemanticFallbackChunk(
+                    window, filePath, relativePath, language, i
+                );
+                allChunks.push(fallbackChunk);
+            }
+        }
+
+        // Step 4: Remove duplicates from overlapping windows
+        const deduplicatedChunks = this.removeDuplicateChunks(allChunks);
+
+        const processingTime = Date.now() - startTime;
+        const avgChunkSize = deduplicatedChunks.reduce((sum, chunk) => sum + chunk.size, 0) / deduplicatedChunks.length || 0;
+
+        this.logger.info(`✅ Intelligent range-based parsing complete: ${deduplicatedChunks.length} chunks, ${processingTime}ms`);
+
+        return {
+            chunks: deduplicatedChunks,
+            parseErrors: allErrors,
+            metadata: {
+                totalNodes,
+                totalChunks: deduplicatedChunks.length,
+                averageChunkSize: avgChunkSize,
+                processingTime
+            }
+        };
+    }
+
+    /**
+     * Find semantic boundaries in code (class/function/interface starts)
+     */
+    /**
+     * Create comprehensive chunks from a window ensuring full content coverage
+     */
+    private async createComprehensiveWindowChunks(
+        rootNode: TreeSitterNode,
+        windowContent: string,
+        filePath: string,
+        relativePath: string,
+        language: string,
+        windowIndex: number
+    ): Promise<SemanticChunk[]> {
+        const chunks: SemanticChunk[] = [];
+        const lines = windowContent.split('\n');
+
+        // First, find semantic units (functions, classes, etc.)
+        const semanticUnits = this.findSemanticUnits(rootNode, windowContent);
+        const coveredLines = new Set<number>();
+
+        // Process semantic units first
+        for (const unit of semanticUnits) {
+            const chunk = await this.createChunkFromUnit(
+                unit,
+                windowContent,
+                filePath,
+                relativePath,
+                language
+            );
+
+            if (chunk) {
+                chunks.push(chunk);
+                // Track which lines are covered
+                for (let line = chunk.startLine; line <= chunk.endLine; line++) {
+                    coveredLines.add(line);
+                }
+            }
+        }
+
+        // All content should be covered by semantic units from intelligent windowing
+        // No additional gap-filling needed for large files
+
+        // Sort chunks by start line
+        chunks.sort((a, b) => a.startLine - b.startLine);
+
+        return chunks;
+    }
+
+    /**
+     * Find gaps in line coverage
+     */
+
+    /**
+     * Create chunk from content string
+     */
+    private async createChunkFromContent(
+        content: string,
+        startLine: number,
+        endLine: number,
+        filePath: string,
+        relativePath: string,
+        language: string,
+        chunkType: string
+    ): Promise<SemanticChunk | null> {
+        if (content.trim().length === 0) {
+            return null;
+        }
+
+        // Extract symbols from content if possible
+        const symbols: SemanticChunk['symbols'] = [];
+
+        try {
+            // Simple regex-based symbol extraction for gap content
+            this.extractBasicSymbols(content, symbols, startLine);
+        } catch (error) {
+            // Continue without symbols if extraction fails
+        }
+
+        return {
+            id: this.generateShortId(filePath, `${startLine}-${endLine}`),
+            content: content.trim(),
+            filePath,
+            relativePath,
+            startLine,
+            endLine,
+            language,
+            chunkType: chunkType as SemanticChunk['chunkType'],
+            size: content.length,
+            complexity: 'low', // Simple default complexity
+            symbols: [], // Will be populated by IndexingOrchestrator
+            imports: [] // TODO: Implement import extraction if needed
+        };
+    }
+
+    /**
+     * Extract basic symbols using simple patterns for gap content
+     */
+    private extractBasicSymbols(content: string, symbols: SemanticChunk['symbols'], baseLineNumber: number): void {
+        const lines = content.split('\n');
+
+        lines.forEach((line, i) => {
+            const lineNumber = baseLineNumber + i;
+            const trimmed = line.trim();
+
+            // Function declarations (TypeScript/JavaScript/Python)
+            const funcMatch = trimmed.match(/^(?:export\s+)?(?:async\s+)?function\s+(\w+)/) ||
+                             trimmed.match(/^(?:async\s+)?def\s+(\w+)\s*\(/); // Python
+            if (funcMatch) {
+                symbols.push({
+                    name: funcMatch[1],
+                    type: 'function',
+                    startLine: lineNumber,
+                    endLine: lineNumber
+                });
+            }
+
+            // Class declarations (TypeScript/JavaScript/Python)
+            const classMatch = trimmed.match(/^(?:export\s+)?class\s+(\w+)/) ||
+                              trimmed.match(/^class\s+(\w+)\s*(?:\(.*\))?:/); // Python
+            if (classMatch) {
+                symbols.push({
+                    name: classMatch[1],
+                    type: 'class',
+                    startLine: lineNumber,
+                    endLine: lineNumber
+                });
+            }
+
+            // Interface declarations
+            const interfaceMatch = trimmed.match(/^(?:export\s+)?interface\s+(\w+)/);
+            if (interfaceMatch) {
+                symbols.push({
+                    name: interfaceMatch[1],
+                    type: 'interface',
+                    startLine: lineNumber,
+                    endLine: lineNumber
+                });
+            }
+
+            // Type declarations
+            const typeMatch = trimmed.match(/^(?:export\s+)?type\s+(\w+)/);
+            if (typeMatch) {
+                symbols.push({
+                    name: typeMatch[1],
+                    type: 'type',
+                    startLine: lineNumber,
+                    endLine: lineNumber
+                });
+            }
+        });
+    }
+
+    private findSemanticBoundaries(content: string): Array<{ line: number; type: string; name?: string }> {
+        const lines = content.split('\n');
+        const boundaries: Array<{ line: number; type: string; name?: string }> = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+
+            // Major semantic boundaries for TypeScript/JavaScript
+            if (line.match(/^(export\s+)?(class|interface|enum)\s+\w+/)) {
+                const match = line.match(/^(export\s+)?(class|interface|enum)\s+(\w+)/);
+                boundaries.push({
+                    line: i,
+                    type: match?.[2] || 'class',
+                    name: match?.[3]
+                });
+            } else if (line.match(/^(export\s+)?(async\s+)?function\s+\w+/)) {
+                const match = line.match(/^(export\s+)?(async\s+)?function\s+(\w+)/);
+                boundaries.push({
+                    line: i,
+                    type: 'function',
+                    name: match?.[3]
+                });
+            } else if (line.match(/^(export\s+)?(const|let|var)\s+\w+\s*=/)) {
+                const match = line.match(/^(export\s+)?(const|let|var)\s+(\w+)/);
+                boundaries.push({
+                    line: i,
+                    type: 'variable',
+                    name: match?.[3]
+                });
+            }
+            // Python semantic boundaries
+            else if (line.match(/^class\s+\w+\s*(?:\(.*\))?:/)) {
+                const match = line.match(/^class\s+(\w+)/);
+                boundaries.push({
+                    line: i,
+                    type: 'class',
+                    name: match?.[1]
+                });
+            } else if (line.match(/^(?:async\s+)?def\s+\w+\s*\(/)) {
+                const match = line.match(/^(?:async\s+)?def\s+(\w+)/);
+                boundaries.push({
+                    line: i,
+                    type: 'function',
+                    name: match?.[1]
+                });
+            } else if (line.match(/^@\w+/)) {
+                // Python decorators - often mark semantic boundaries
+                boundaries.push({
+                    line: i,
+                    type: 'decorator'
+                });
+            }
+        }
+
+        return boundaries;
+    }
+
+    /**
+     * Create intelligent windows that respect semantic boundaries
+     */
+    private createIntelligentWindows(
+        content: string,
+        boundaries: Array<{ line: number; type: string; name?: string }>,
+        windowSize: number,
+        overlapSize: number
+    ): Array<{ content: string; startLine: number; endLine: number; startByte: number; endByte: number }> {
+        const lines = content.split('\n');
+        const windows: Array<{ content: string; startLine: number; endLine: number; startByte: number; endByte: number }> = [];
+
+        let currentStart = 0;
+
+        while (currentStart < lines.length) {
+            // Find optimal end point respecting semantic boundaries
+            let currentEnd = Math.min(currentStart + Math.floor(windowSize / 50), lines.length); // ~50 chars per line estimate
+
+            // Adjust end to semantic boundary if possible
+            const nearbyBoundary = boundaries.find(b =>
+                b.line > currentEnd - 10 && b.line < currentEnd + 10
+            );
+
+            if (nearbyBoundary && nearbyBoundary.line < lines.length - 5) {
+                currentEnd = nearbyBoundary.line;
+            }
+
+            const windowLines = lines.slice(currentStart, currentEnd);
+            const windowContent = windowLines.join('\n');
+
+            // Ensure window is under size limit
+            if (windowContent.length > windowSize) {
+                // Trim to size while preserving semantic integrity
+                currentEnd = this.findSafeTrimPoint(lines, currentStart, windowSize);
+                const trimmedContent = lines.slice(currentStart, currentEnd).join('\n');
+
+                if (trimmedContent.length > 0) {
+                    windows.push({
+                        content: trimmedContent,
+                        startLine: currentStart,
+                        endLine: currentEnd,
+                        startByte: this.calculateByteOffset(content, currentStart),
+                        endByte: this.calculateByteOffset(content, currentEnd)
+                    });
+                }
+            } else if (windowContent.length > 0) {
+                windows.push({
+                    content: windowContent,
+                    startLine: currentStart,
+                    endLine: currentEnd,
+                    startByte: this.calculateByteOffset(content, currentStart),
+                    endByte: this.calculateByteOffset(content, currentEnd)
+                });
+            }
+
+            // Move to next window with meaningful overlap
+            const overlapLines = Math.floor(overlapSize / 50); // ~40 lines for 2KB overlap
+            const minIncrement = Math.max(50, Math.floor((currentEnd - currentStart) / 2)); // At least 50 lines or half window
+
+            currentStart = Math.max(
+                currentStart + minIncrement,
+                currentEnd - overlapLines
+            );
+
+            // Prevent infinite loop and tiny windows at end
+            if (currentStart >= currentEnd - 10 || currentEnd >= lines.length - 10) {
+                break; // End processing to avoid tiny windows
+            }
+        }
+
+        return windows;
+    }
+
+    private findSafeTrimPoint(lines: string[], start: number, maxSize: number): number {
+        let size = 0;
+        let lastSafeTrim = start;
+
+        for (let i = start; i < lines.length; i++) {
+            const lineSize = lines[i].length + 1; // +1 for newline
+            if (size + lineSize > maxSize) break;
+
+            size += lineSize;
+
+            // Safe trim points: end of functions, classes, or natural breaks
+            const line = lines[i].trim();
+            if (line === '}' || line === '' || line.startsWith('//')) {
+                lastSafeTrim = i + 1;
+            }
+        }
+
+        return Math.max(lastSafeTrim, start + 1);
+    }
+
+    private calculateByteOffset(content: string, lineNumber: number): number {
+        const lines = content.split('\n');
+        let offset = 0;
+        for (let i = 0; i < Math.min(lineNumber, lines.length); i++) {
+            offset += lines[i].length + 1; // +1 for newline
+        }
+        return offset;
+    }
+
+    /**
+     * Create a semantic fallback chunk when TreeSitter fails
+     */
+    private createSemanticFallbackChunk(
+        window: { content: string; startLine: number; endLine: number },
+        filePath: string,
+        relativePath: string,
+        language: string,
+        windowIndex: number
+    ): SemanticChunk {
+        // Symbol extraction removed - handled by IndexingOrchestrator
+
+        return {
+            id: this.generateShortId(filePath, `semantic_fallback_w${windowIndex}`),
+            content: window.content,
+            filePath,
+            relativePath,
+            startLine: window.startLine + 1,
+            endLine: window.endLine,
+            language,
+            chunkType: 'mixed',
+            symbols: [], // Will be populated by IndexingOrchestrator
+            imports: this.extractImportsFromContent(window.content),
+            size: window.content.length,
+            complexity: this.calculateComplexity(window.content)
+        };
+    }
+
+    /**
+     * Extract imports from content
+     */
+    private extractImportsFromContent(content: string): Array<{ module: string; symbols: string[]; line: number }> {
+        const imports: Array<{ module: string; symbols: string[]; line: number }> = [];
+        const lines = content.split('\n');
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+
+            // TypeScript/JavaScript imports
+            if (line.startsWith('import ')) {
+                const moduleMatch = line.match(/from\s+['"]([^'"]+)['"]/);
+                const symbolsMatch = line.match(/import\s+\{([^}]+)\}/);
+
+                imports.push({
+                    module: moduleMatch?.[1] || 'unknown',
+                    symbols: symbolsMatch?.[1]?.split(',').map(s => s.trim()) || [],
+                    line: i + 1
+                });
+            }
+            // Python imports
+            else if (line.startsWith('from ') && line.includes(' import ')) {
+                const match = line.match(/from\s+([^\s]+)\s+import\s+(.+)/);
+                if (match) {
+                    const module = match[1];
+                    const symbolsStr = match[2];
+                    const symbols = symbolsStr.split(',').map(s => s.trim().split(' as ')[0]);
+
+                    imports.push({
+                        module,
+                        symbols: [], // Will be populated by IndexingOrchestrator
+                        line: i + 1
+                    });
+                }
+            } else if (line.startsWith('import ') && !line.includes(' from ')) {
+                const match = line.match(/import\s+([^\s]+)(?:\s+as\s+\w+)?/);
+                if (match) {
+                    imports.push({
+                        module: match[1],
+                        symbols: [],
+                        line: i + 1
+                    });
+                }
+            }
+        }
+
+        return imports;
+    }
+
+    /**
+     * Remove duplicate chunks from overlapping windows
+     */
+    private removeDuplicateChunks(chunks: SemanticChunk[]): SemanticChunk[] {
+        const uniqueChunks: SemanticChunk[] = [];
+        const seenRanges = new Set<string>();
+
+        for (const chunk of chunks) {
+            const rangeKey = `${chunk.startLine}-${chunk.endLine}-${chunk.chunkType}`;
+
+            if (!seenRanges.has(rangeKey)) {
+                seenRanges.add(rangeKey);
+                uniqueChunks.push(chunk);
+            }
+        }
+
+        return uniqueChunks;
+    }
+
+
+    private fallbackToSimpleChunking(
+        content: string,
+        filePath: string,
+        relativePath: string,
+        language: string
+    ): ChunkExtractionResult {
+        this.logger.warn(`Falling back to simple chunking for ${filePath}`);
+        
+        // Simple line-based chunking as fallback
+        const lines = content.split('\n');
+        const chunks: SemanticChunk[] = [];
+        const chunkSize = 50; // lines per chunk
+        
+        for (let i = 0; i < lines.length; i += chunkSize) {
+            const chunkLines = lines.slice(i, i + chunkSize);
+            const chunkContent = chunkLines.join('\n');
+            // Symbol extraction removed - handled by IndexingOrchestrator
+            
+            chunks.push({
+                id: this.generateShortId(filePath, `fb_${i}`),
+                content: chunkContent,
+                filePath,
+                relativePath,
+                startLine: i + 1,
+                endLine: i + chunkLines.length,
+                language,
+                chunkType: 'mixed',
+                symbols: [], // Will be populated by IndexingOrchestrator
+                imports: [],
+                size: chunkContent.length,
+                complexity: 'low'
+            });
+        }
+
+        return {
+            chunks,
+            parseErrors: ['Fallback chunking used'],
+            metadata: {
+                totalNodes: 0,
+                totalChunks: chunks.length,
+                averageChunkSize: chunks.reduce((sum, chunk) => sum + chunk.size, 0) / chunks.length || 0,
+                processingTime: 0
+            }
+        };
+    }
+}
+
+// Helper interface for internal use
+interface SemanticUnit {
+    type: SemanticChunk['chunkType'];
+    startIndex: number;
+    endIndex: number;
+    startLine: number;
+    endLine: number;
+    node: TreeSitterNode;
+    content: string;
+}
