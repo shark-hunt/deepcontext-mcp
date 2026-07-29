@@ -79,4 +79,3 @@ export async function recordRateLimitUsage(apiKeyId: number, eventType: EventTyp
   });
 }
 
-
